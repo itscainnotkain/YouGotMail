@@ -729,6 +729,218 @@ describe('durable sending', () => {
   });
 });
 describe('automatic domain setup safety', () => {
+  function mockDomainSetup(
+    options: { routingError?: string; disabledSender?: boolean } = {},
+  ) {
+    const records = [
+      ...[1, 2, 3].map((n) => ({
+        id: `mx-${n}`,
+        type: 'MX',
+        name: 'example.com',
+        content: `route${n}.mx.cloudflare.net`,
+        priority: n * 10,
+      })),
+      {
+        id: 'spf',
+        type: 'TXT',
+        name: 'example.com',
+        content: 'v=spf1 include:_spf.mx.cloudflare.net ~all',
+      },
+      {
+        id: 'dmarc',
+        type: 'TXT',
+        name: '_dmarc.example.com',
+        content: 'v=DMARC1; p=reject;',
+      },
+    ];
+    const rule = {
+      id: 'old-rule',
+      name: 'Old forwarding',
+      enabled: true,
+      priority: 3,
+      matchers: [{ type: 'literal', field: 'to', value: 'hello@example.com' }],
+      actions: [{ type: 'forward', value: ['old@example.net'] }],
+    };
+    let route = {
+      enabled: false,
+      actions: [] as { type: string; value?: string[] }[],
+    };
+    let sender = options.disabledSender
+      ? {
+          name: 'example.com',
+          tag: 'native-domain',
+          enabled: false,
+          dkim_selector: 'native-selector',
+          return_path_domain: 'cf-bounce.example.com',
+        }
+      : null;
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(async (input, init) => {
+        const url = new URL(String(input)),
+          method = init?.method || 'GET';
+        const payload = init?.body ? JSON.parse(String(init.body)) : undefined;
+        const reply = (result: unknown) =>
+          new Response(JSON.stringify({ success: true, result }));
+        const rejected = (message: string) =>
+          new Response(
+            JSON.stringify({
+              success: false,
+              errors: [{ code: 1000, message }],
+            }),
+            { status: 400 },
+          );
+        if (url.hostname === 'cloudflare-dns.com') {
+          const type = url.searchParams.get('type');
+          return new Response(
+            JSON.stringify({
+              Answer:
+                type === 'MX'
+                  ? [1, 2, 3].map((n) => ({
+                      data: `${n * 10} route${n}.mx.cloudflare.net.`,
+                    }))
+                  : [
+                      {
+                        data:
+                          url.searchParams.get('name') ===
+                          'cf-bounce.example.com'
+                            ? '"v=spf1 include:_spf.mx.cloudflare.net ~all"'
+                            : '"v=DKIM1; p=public-key"',
+                      },
+                    ],
+            }),
+          );
+        }
+        const path = url.pathname;
+        if (path.endsWith('/dns_records') && method === 'GET')
+          return reply(records);
+        if (path.endsWith('/dns_records/spf') && method === 'PATCH')
+          return reply(payload);
+        if (path.endsWith('/email/routing/dns')) {
+          // Cloudflare treats the optional name as a subdomain. Apex onboarding must omit it.
+          if (payload?.name)
+            return rejected(
+              'Invalid Input: must be a subdomains of example.com',
+            );
+          if (options.routingError) return rejected(options.routingError);
+          return reply({ enabled: true, name: 'example.com' });
+        }
+        if (path.endsWith('/email/routing') && method === 'PATCH')
+          return reply({ enabled: true });
+        if (path.endsWith('/email/routing/rules') && method === 'GET')
+          return reply([rule]);
+        if (path.endsWith('/email/routing/rules/old-rule')) {
+          if (method !== 'PUT' || !payload?.matchers || !payload?.actions)
+            return rejected('Routing rules require a complete PUT request');
+          rule.enabled = payload.enabled;
+          return reply({ ...rule });
+        }
+        if (path.endsWith('/email/routing/rules/catch_all')) {
+          if (method === 'PUT') route = payload;
+          return reply(route);
+        }
+        if (path.endsWith('/email/sending/subdomains')) {
+          if (method === 'GET') return reply(sender ? [sender] : []);
+          if (method === 'POST') {
+            sender = {
+              name: payload.name,
+              tag: 'native-domain',
+              enabled: true,
+              dkim_selector: 'native-selector',
+              return_path_domain: 'cf-bounce.example.com',
+            };
+            return reply(sender);
+          }
+        }
+        if (path.endsWith('/email/sending/subdomains/native-domain'))
+          return reply(sender);
+        throw new Error(`Unexpected setup request: ${method} ${path}`);
+      });
+    return { fetch, rule };
+  }
+  async function connectSetup() {
+    await putIntegration(env, 'cloudflare', {
+      token: 'test-cloudflare-token',
+      accountId: 'account',
+      workerName: 'yougotmail',
+      queueId: '',
+    });
+  }
+  it('configures apex routing without a subdomain name and migrates forwarding rules with complete PUT requests', async () => {
+    await connectSetup();
+    const { fetch, rule } = mockDomainSetup();
+    const d = await getDomain(env, domain),
+      preview = await previewDomain(env, d);
+    const result = await applyDomain(env, d, preview.snapshot, true);
+    expect(result.receiving_status).toBe('ready');
+    expect(result.sending_status).toBe('ready');
+    expect(result.provider_domain_id).toBe('native-domain');
+    expect((await getDomain(env, domain)).setup_lock_until).toBe(0);
+    const routingCall = fetch.mock.calls.find(
+      ([input, init]) =>
+        String(input).endsWith('/email/routing/dns') && init?.method === 'POST',
+    );
+    expect(JSON.parse(String(routingCall![1]!.body))).toEqual({});
+    const migrationCall = fetch.mock.calls.find(([input]) =>
+      String(input).endsWith('/email/routing/rules/old-rule'),
+    );
+    expect(migrationCall![1]!.method).toBe('PUT');
+    expect(JSON.parse(String(migrationCall![1]!.body))).toMatchObject({
+      enabled: false,
+      matchers: rule.matchers,
+      actions: rule.actions,
+      priority: 3,
+    });
+    const repeatedPreview = await previewDomain(env, result);
+    await applyDomain(env, result, repeatedPreview.snapshot, false);
+    expect(
+      fetch.mock.calls.filter(
+        ([input, init]) =>
+          String(input).endsWith('/email/sending/subdomains') &&
+          init?.method === 'POST',
+      ),
+    ).toHaveLength(1);
+  });
+  it('identifies the failing setup step and releases the lock so a corrected request can be retried', async () => {
+    await connectSetup();
+    const options = { routingError: 'Permission denied' };
+    const { fetch } = mockDomainSetup(options);
+    const d = await getDomain(env, domain),
+      preview = await previewDomain(env, d);
+    await expect(applyDomain(env, d, preview.snapshot, true)).rejects.toThrow(
+      'Enabling incoming mail: Permission denied',
+    );
+    const failed = await getDomain(env, domain);
+    expect(failed.last_error).toBe('Enabling incoming mail: Permission denied');
+    expect(failed.setup_lock_until).toBe(0);
+    expect(
+      fetch.mock.calls.some(([input]) =>
+        String(input).includes('/email/sending/'),
+      ),
+    ).toBe(false);
+    options.routingError = '';
+    const retryPreview = await previewDomain(env, failed);
+    expect(
+      (await applyDomain(env, failed, retryPreview.snapshot, true))
+        .sending_status,
+    ).toBe('ready');
+  });
+  it('reenables an existing disabled native sending domain instead of treating it as configured', async () => {
+    await connectSetup();
+    const { fetch } = mockDomainSetup({ disabledSender: true });
+    const d = await getDomain(env, domain),
+      preview = await previewDomain(env, d);
+    expect(
+      (await applyDomain(env, d, preview.snapshot, true)).sending_status,
+    ).toBe('ready');
+    expect(
+      fetch.mock.calls.some(
+        ([input, init]) =>
+          String(input).endsWith('/email/sending/subdomains') &&
+          init?.method === 'POST',
+      ),
+    ).toBe(true);
+  });
   it('normalises provider-relative DNS names before installation', () => {
     expect(providerDnsName('resend._domainkey', 'example.com')).toBe(
       'resend._domainkey.example.com',

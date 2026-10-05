@@ -81,6 +81,8 @@ export async function previewDomain(env: Env, domain: Domain) {
     enabled: boolean;
     name: string;
     actions: { type: string; value?: string[] }[];
+    matchers: { type: string; field?: string; value?: string }[];
+    priority?: number;
   }>(env, `/zones/${domain.zone_id}/email/routing/rules`);
   const enabledRules = (explicitRules || []).filter(
     (r) =>
@@ -240,6 +242,7 @@ export async function applyDomain(
       409,
       'This domain is already being configured. Wait for the current setup to finish.',
     );
+  let step = 'Updating mail DNS records';
   try {
     for (const record of preview.mxConflicts)
       await cf(
@@ -249,20 +252,30 @@ export async function applyDomain(
       );
     for (const record of preview.required.filter((r) => r.type === 'TXT'))
       await upsertDns(env, domain.zone_id, record);
-    await cf(env, `/zones/${domain.zone_id}/email/routing/dns`, 'POST', {
-      name: domain.name,
-    });
+    // This app configures zone apex domains. Supplying `name` selects the
+    // subdomain onboarding flow, which rejects a name equal to the zone apex.
+    step = 'Enabling incoming mail';
+    await cf(env, `/zones/${domain.zone_id}/email/routing/dns`, 'POST', {});
+    step = 'Configuring incoming mail settings';
     await cf(env, `/zones/${domain.zone_id}/email/routing`, 'PATCH', {
       support_subaddress: true,
       skip_wizard: true,
     });
+    step = 'Migrating existing forwarding rules';
     for (const rule of preview.enabledRules)
       await cf(
         env,
         `/zones/${domain.zone_id}/email/routing/rules/${rule.id}`,
-        'PATCH',
-        { enabled: false },
+        'PUT',
+        {
+          enabled: false,
+          name: rule.name,
+          matchers: rule.matchers,
+          actions: rule.actions,
+          ...(rule.priority === undefined ? {} : { priority: rule.priority }),
+        },
       );
+    step = 'Connecting incoming mail to this app';
     await cf(
       env,
       `/zones/${domain.zone_id}/email/routing/rules/catch_all`,
@@ -280,14 +293,17 @@ export async function applyDomain(
       .bind(domain.id)
       .run();
     if (domain.provider === 'cloudflare') {
+      step = 'Enabling native Cloudflare sending';
       const existing = (
-        await cfList<{ name: string; tag: string; id?: string }>(
-          env,
-          `/zones/${domain.zone_id}/email/sending/subdomains`,
-        )
+        await cfList<{
+          name: string;
+          tag: string;
+          id?: string;
+          enabled: boolean;
+        }>(env, `/zones/${domain.zone_id}/email/sending/subdomains`)
       ).find((d) => d.name === domain.name);
       const d =
-        existing ||
+        (existing?.enabled ? existing : null) ||
         (await cf<{ id?: string; tag: string }>(
           env,
           `/zones/${domain.zone_id}/email/sending/subdomains`,
@@ -298,6 +314,7 @@ export async function applyDomain(
       await env.DB.prepare('UPDATE domains SET provider_domain_id=? WHERE id=?')
         .bind(providerId, domain.id)
         .run();
+      step = 'Configuring sending authentication';
       // Existing DMARC policy is retained. Start new domains in monitoring mode.
       if (
         !preview.existing.some(
@@ -343,6 +360,7 @@ export async function applyDomain(
         }
       }
     } else {
+      step = 'Enabling Resend sending';
       let providerId = domain.provider_domain_id;
       if (!providerId) {
         const domains = await resend<{ data: ResendDomain[] }>(env, '/domains');
@@ -383,7 +401,7 @@ export async function applyDomain(
     }
     return await checkDomain(env, await getDomain(env, domain.id));
   } catch (e) {
-    const message = e instanceof Error ? e.message : 'Domain setup failed';
+    const message = `${step}: ${e instanceof Error ? e.message : 'Domain setup failed'}`;
     await env.DB.prepare(
       'UPDATE domains SET last_error=?,last_checked=? WHERE id=?',
     )
