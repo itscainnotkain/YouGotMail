@@ -1,0 +1,3 @@
+# Generate both values with: npm run generate-secrets
+SETUP_TOKEN=replace-with-a-unique-random-setup-token-at-least-32-characters
+APP_KEY=replace-with-a-32-byte-base64-encryption-key

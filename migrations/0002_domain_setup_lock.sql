@@ -1,0 +1,1 @@
+ALTER TABLE domains ADD COLUMN setup_lock_until INTEGER NOT NULL DEFAULT 0;
