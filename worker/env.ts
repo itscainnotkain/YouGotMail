@@ -17,7 +17,9 @@ export type AppEnv = {
   Variables: { user: User; session: { id: string; csrf: string } };
 };
 export type Task =
-  { kind: 'ingest'; id: string } | { kind: 'send'; id: string };
+  | { kind: 'ingest'; id: string }
+  | { kind: 'send'; id: string }
+  | { kind: 'purge-mailbox'; id: string };
 
 export class AppError extends Error {
   constructor(

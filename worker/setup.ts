@@ -379,10 +379,20 @@ setup.patch('/domains/:id', async (c) => {
       .bind(data.provider, domain.id)
       .run();
   }
-  if (data.catchAllMailbox !== undefined)
-    await c.env.DB.prepare('UPDATE domains SET catch_all_mailbox=? WHERE id=?')
-      .bind(data.catchAllMailbox, domain.id)
+  if (data.catchAllMailbox !== undefined) {
+    const result = await c.env.DB.prepare(
+      'UPDATE domains SET catch_all_mailbox=? WHERE id=? AND (? IS NULL OR EXISTS(SELECT 1 FROM mailboxes WHERE id=?))',
+    )
+      .bind(
+        data.catchAllMailbox,
+        domain.id,
+        data.catchAllMailbox,
+        data.catchAllMailbox,
+      )
       .run();
+    if (!result.meta.changes)
+      throw new AppError(409, 'Mailbox is no longer available');
+  }
   await audit(c.env, c.get('user').id, 'domain.update', domain.id);
   return c.json(await getDomain(c.env, domain.id));
 });

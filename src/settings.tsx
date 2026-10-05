@@ -71,6 +71,7 @@ export async function refreshSettings() {
     queryClient.invalidateQueries({ queryKey: ['setup'] }),
     queryClient.invalidateQueries({ queryKey: ['status'] }),
     queryClient.invalidateQueries({ queryKey: ['admin-mailboxes'] }),
+    queryClient.invalidateQueries({ queryKey: ['labels'] }),
     queryClient.invalidateQueries({ queryKey: ['users'] }),
     invalidateMail(),
   ]);
@@ -1288,6 +1289,8 @@ export function MailboxSettings() {
     [alias, setAlias] = useState<AdminMailbox | null>(null),
     [editing, setEditing] = useState<AdminMailbox | null>(null),
     [memberBox, setMemberBox] = useState<AdminMailbox | null>(null),
+    [deleting, setDeleting] = useState<AdminMailbox | null>(null),
+    [deleteConfirmation, setDeleteConfirmation] = useState(''),
     [expanded, setExpanded] = useState('');
   const chooseMember = (id: string, checked: boolean) =>
     setMembers((old) =>
@@ -1435,6 +1438,16 @@ export function MailboxSettings() {
                   >
                     Manage members
                   </button>
+                  <button
+                    className="btn danger small"
+                    onClick={() => {
+                      setDeleting(b);
+                      setDeleteConfirmation('');
+                    }}
+                  >
+                    <Trash2 size={15} />
+                    Delete mailbox
+                  </button>
                 </div>
               </div>
             )}
@@ -1445,6 +1458,62 @@ export function MailboxSettings() {
           <Layers size={28} />
           <p>Add a domain, then create your first mailbox.</p>
         </div>
+      )}
+      {deleting && (
+        <Modal
+          title={`Delete ${deleting.name}?`}
+          onClose={() => !busy && setDeleting(null)}
+        >
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (busy || deleteConfirmation !== deleting.name) return;
+              void run(async () => {
+                await api(`/admin/mailboxes/${deleting.id}`, {
+                  method: 'DELETE',
+                  body: { confirmation: deleteConfirmation },
+                });
+                setDeleting(null);
+                setExpanded('');
+                await refreshSettings();
+              }, 'Mailbox deleted. Stored files are being removed.');
+            }}
+          >
+            <p className="modal-copy">
+              Permanently delete this mailbox, all its messages, drafts,
+              attachments, addresses and aliases, labels, and filters. Queued
+              and scheduled emails will be cancelled. Any domain using this
+              mailbox for catch-all will have catch-all disabled. This cannot be
+              undone.
+            </p>
+            <p className="modal-copy">User accounts and domains will remain.</p>
+            <Field label={`Type ${deleting.name} to confirm`}>
+              <input
+                autoFocus
+                required
+                autoComplete="off"
+                value={deleteConfirmation}
+                onChange={(e) => setDeleteConfirmation(e.target.value)}
+              />
+            </Field>
+            <footer>
+              <button
+                type="button"
+                className="btn secondary"
+                disabled={busy}
+                onClick={() => setDeleting(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn danger"
+                disabled={busy || deleteConfirmation !== deleting.name}
+              >
+                {busy ? 'Deleting…' : 'Delete permanently'}
+              </button>
+            </footer>
+          </form>
+        </Modal>
       )}
       {(create || alias) && (
         <Modal

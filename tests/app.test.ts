@@ -33,6 +33,7 @@ import {
   providerDnsName,
 } from '../worker/domains';
 import { scheduledHandler } from '../worker/jobs';
+import { purgeMailboxFiles } from '../worker/mailbox-deletion';
 
 const owner = '11111111-1111-4111-8111-111111111111',
   member = '22222222-2222-4222-8222-222222222222',
@@ -498,6 +499,306 @@ describe('incoming email and organisation', () => {
       ((await env.DB.prepare('SELECT folder FROM threads').first()) as any)
         .folder,
     ).toBe('spam');
+  });
+});
+describe('mailbox deletion', () => {
+  it('requires administrator access, CSRF and the exact mailbox name', async () => {
+    const path = `/admin/mailboxes/${box}`;
+    expect(
+      (await request(path, 'DELETE', { confirmation: 'Personal' }, 'member'))
+        .status,
+    ).toBe(403);
+    expect(
+      (await request(path, 'DELETE', { confirmation: 'Personal' }, 'none'))
+        .status,
+    ).toBe(401);
+    expect(
+      (
+        await request(path, 'DELETE', { confirmation: 'Personal' }, 'owner', {
+          'X-CSRF-Token': '',
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (await request(path, 'DELETE', { confirmation: 'personal' })).status,
+    ).toBe(400);
+    expect((await request(path, 'DELETE', {})).status).toBe(400);
+    expect(
+      await env.DB.prepare('SELECT id FROM mailboxes WHERE id=?')
+        .bind(box)
+        .first(),
+    ).toBeTruthy();
+    expect(
+      (await env.DB.prepare('SELECT * FROM mailbox_deletions').all()).results,
+    ).toHaveLength(0);
+  });
+
+  it('removes mail and aliases, cancels queued sends, clears references, and preserves other mailboxes and accounts', async () => {
+    await incoming();
+    const other = await incoming({ mailboxId: shared });
+    const d = await draft();
+    const queued = await request(`/mail/drafts/${d.id}/send`, 'POST', {
+      revision: d.revision,
+      key: crypto.randomUUID(),
+      dueAt: Date.now() + 3600_000,
+    });
+    expect(queued.status).toBe(200);
+    const job = (await queued.json()) as any;
+    await draft();
+    const raw =
+      'From: friend@example.net\r\nTo: owner@example.com\r\nSubject: Pending\r\n\r\nHello';
+    await receiveEmail(
+      {
+        from: 'friend@example.net',
+        to: 'owner@example.com',
+        rawSize: raw.length,
+        raw: new Blob([raw]).stream(),
+        setReject: vi.fn(),
+      } as any,
+      env,
+    );
+    const ingestion = await env.DB.prepare('SELECT id FROM ingestions').first<{
+      id: string;
+    }>();
+    const invitation = crypto.randomUUID();
+    await env.DB.batch([
+      env.DB.prepare('UPDATE domains SET catch_all_mailbox=? WHERE id=?').bind(
+        box,
+        domain,
+      ),
+      env.DB.prepare(
+        'INSERT INTO invitations(id,token_hash,email,name,role,mailbox_ids,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)',
+      ).bind(
+        invitation,
+        'invitation-hash',
+        'new@example.net',
+        'New member',
+        'member',
+        JSON.stringify([box, shared]),
+        Date.now() + 86400_000,
+        Date.now(),
+      ),
+      env.DB.prepare(
+        'INSERT INTO addresses(id,mailbox_id,domain_id,email) VALUES(?,?,?,?)',
+      ).bind(crypto.randomUUID(), box, domain, 'alias@example.com'),
+      env.DB.prepare(
+        'INSERT INTO labels(id,mailbox_id,name) VALUES(?,?,?)',
+      ).bind(crypto.randomUUID(), box, 'Private'),
+      env.DB.prepare(
+        'INSERT INTO filters(id,mailbox_id,name,conditions,actions) VALUES(?,?,?,?,?)',
+      ).bind(crypto.randomUUID(), box, 'Filter', '{}', '{}'),
+    ]);
+    jobs.send.mockRejectedValueOnce(new Error('Queue temporarily unavailable'));
+    expect(
+      (
+        await request(`/admin/mailboxes/${box}`, 'DELETE', {
+          confirmation: 'Personal',
+        })
+      ).status,
+    ).toBe(202);
+    for (const table of [
+      'mailboxes',
+      'mailbox_members',
+      'addresses',
+      'threads',
+      'messages',
+      'attachments',
+      'labels',
+      'drafts',
+      'send_jobs',
+      'ingestions',
+      'filters',
+      'search_chunks',
+    ]) {
+      const column = table === 'mailboxes' ? 'id' : 'mailbox_id';
+      expect(
+        (
+          await env.DB.prepare(`SELECT * FROM ${table} WHERE ${column}=?`)
+            .bind(box)
+            .all()
+        ).results,
+        table,
+      ).toHaveLength(0);
+    }
+    expect(
+      (await env.DB.prepare('SELECT * FROM users').all()).results,
+    ).toHaveLength(2);
+    expect(
+      await env.DB.prepare('SELECT id FROM messages WHERE id=?')
+        .bind(other.id)
+        .first(),
+    ).toBeTruthy();
+    expect(
+      await env.FILES.get(`bodies/${shared}/${other.id}.json`),
+    ).toBeTruthy();
+    expect(
+      (await env.DB.prepare('SELECT catch_all_mailbox FROM domains WHERE id=?')
+        .bind(domain)
+        .first())!.catch_all_mailbox,
+    ).toBeNull();
+    expect(
+      JSON.parse(
+        String(
+          (await env.DB.prepare(
+            'SELECT mailbox_ids FROM invitations WHERE id=?',
+          )
+            .bind(invitation)
+            .first())!.mailbox_ids,
+        ),
+      ),
+    ).toEqual([shared]);
+    expect(await resolveRecipient(env, 'owner@example.com')).toBeNull();
+    expect(await resolveRecipient(env, 'alias@example.com')).toBeNull();
+    expect(await resolveRecipient(env, 'unknown@example.com')).toBeNull();
+    await dispatchSend(env, job.id);
+    await processIngestion(env, ingestion!.id);
+    expect(send).not.toHaveBeenCalled();
+    await scheduledHandler(env);
+    for (const prefix of ['raw', 'bodies', 'attachments', 'outbox'])
+      expect(
+        (await env.FILES.list({ prefix: `${prefix}/${box}/` })).objects,
+      ).toHaveLength(0);
+    expect(
+      (await env.DB.prepare('SELECT * FROM mailbox_deletions').all()).results,
+    ).toHaveLength(0);
+    expect(
+      await env.DB.prepare(
+        "SELECT id FROM audit WHERE action='mailbox.delete' AND target=?",
+      )
+        .bind(box)
+        .first(),
+    ).toBeTruthy();
+    expect(
+      (
+        await request(`/admin/mailboxes/${box}`, 'DELETE', {
+          confirmation: 'Personal',
+        })
+      ).status,
+    ).toBe(404);
+  });
+
+  it('blocks deletion during active processing without partially clearing metadata', async () => {
+    await incoming();
+    const d = await draft();
+    await env.DB.batch([
+      env.DB.prepare('UPDATE drafts SET send_lock=? WHERE id=?').bind(
+        'active-lock',
+        d.id,
+      ),
+      env.DB.prepare('UPDATE domains SET catch_all_mailbox=? WHERE id=?').bind(
+        box,
+        domain,
+      ),
+    ]);
+    expect(
+      (
+        await request(`/admin/mailboxes/${box}`, 'DELETE', {
+          confirmation: 'Personal',
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await env.DB.prepare('SELECT * FROM search_chunks WHERE mailbox_id=?')
+          .bind(box)
+          .all()
+      ).results,
+    ).toHaveLength(1);
+    expect(
+      (await env.DB.prepare('SELECT catch_all_mailbox FROM domains WHERE id=?')
+        .bind(domain)
+        .first())!.catch_all_mailbox,
+    ).toBe(box);
+    expect(
+      await env.DB.prepare('SELECT id FROM drafts WHERE id=?')
+        .bind(d.id)
+        .first(),
+    ).toBeTruthy();
+    await env.DB.prepare('UPDATE drafts SET send_lock=NULL WHERE id=?')
+      .bind(d.id)
+      .run();
+    const response = await request(`/mail/drafts/${d.id}/send`, 'POST', {
+      revision: d.revision,
+      key: crypto.randomUUID(),
+    });
+    expect(response.status).toBe(200);
+    await env.DB.prepare("UPDATE send_jobs SET status='sending'").run();
+    expect(
+      (
+        await request(`/admin/mailboxes/${box}`, 'DELETE', {
+          confirmation: 'Personal',
+        })
+      ).status,
+    ).toBe(409);
+    await env.DB.prepare("UPDATE send_jobs SET status='pending'").run();
+    await env.DB.prepare(
+      "INSERT INTO ingestions(id,mailbox_id,envelope_from,envelope_to,raw_key,fingerprint,status,size,created_at) VALUES(?,?,?,?,?,?,'processing',1,?)",
+    )
+      .bind(
+        crypto.randomUUID(),
+        box,
+        'friend@example.net',
+        'owner@example.com',
+        `raw/${box}/active`,
+        'active',
+        Date.now(),
+      )
+      .run();
+    expect(
+      (
+        await request(`/admin/mailboxes/${box}`, 'DELETE', {
+          confirmation: 'Personal',
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (await env.DB.prepare('SELECT * FROM mailbox_deletions').all()).results,
+    ).toHaveLength(0);
+  });
+
+  it('retries storage failures and paginates cleanup without touching another mailbox', async () => {
+    const keys = Array.from(
+      { length: 105 },
+      (_, index) => `attachments/${box}/${index}`,
+    );
+    for (const key of keys) await env.FILES.put(key, 'private');
+    const keep = `attachments/${shared}/keep`;
+    await env.FILES.put(keep, 'keep');
+    expect(
+      (
+        await request(`/admin/mailboxes/${box}`, 'DELETE', {
+          confirmation: 'Personal',
+        })
+      ).status,
+    ).toBe(202);
+    const deletion = await env.DB.prepare(
+      'SELECT id FROM mailbox_deletions',
+    ).first<{ id: string }>();
+    const failed = {
+      ...env,
+      FILES: {
+        list: env.FILES.list.bind(env.FILES),
+        delete: async () => {
+          throw new Error('Storage temporarily unavailable');
+        },
+      },
+    } as unknown as Env;
+    await expect(purgeMailboxFiles(failed, deletion!.id)).rejects.toThrow(
+      'Storage temporarily unavailable',
+    );
+    expect(
+      await env.DB.prepare('SELECT id FROM mailbox_deletions').first(),
+    ).toBeTruthy();
+    await purgeMailboxFiles(env, deletion!.id);
+    await purgeMailboxFiles(env, deletion!.id);
+    expect(
+      (await env.FILES.list({ prefix: `attachments/${box}/` })).objects,
+    ).toHaveLength(0);
+    expect(await env.FILES.get(keep)).toBeTruthy();
+    expect(
+      (await env.DB.prepare('SELECT * FROM mailbox_deletions').all()).results,
+    ).toHaveLength(0);
+    await purgeMailboxFiles(env, deletion!.id);
   });
 });
 describe('durable sending', () => {

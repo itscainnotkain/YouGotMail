@@ -215,8 +215,8 @@ auth.post('/accept-invite', async (c) => {
   for (const mailboxId of json<string[]>(String(invitation.mailbox_ids), []))
     statements.push(
       c.env.DB.prepare(
-        'INSERT INTO mailbox_members(mailbox_id,user_id) SELECT ?,? WHERE EXISTS(SELECT 1 FROM users WHERE id=?)',
-      ).bind(mailboxId, userId, userId),
+        'INSERT INTO mailbox_members(mailbox_id,user_id) SELECT ?,? WHERE EXISTS(SELECT 1 FROM users WHERE id=?) AND EXISTS(SELECT 1 FROM mailboxes WHERE id=?)',
+      ).bind(mailboxId, userId, userId, mailboxId),
     );
   const result = await c.env.DB.batch(statements);
   if (!result[0].meta.changes)

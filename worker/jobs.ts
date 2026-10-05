@@ -2,6 +2,7 @@ import type { Env, Task } from './env';
 import { now, notifyMailbox } from './lib';
 import { dispatchSend, cloudflareEvent, materializeSent } from './sending';
 import { processIngestion } from './receiving';
+import { purgeMailboxFiles } from './mailbox-deletion';
 
 export async function queueHandler(batch: MessageBatch<unknown>, env: Env) {
   for (const message of batch.messages) {
@@ -22,6 +23,8 @@ export async function queueHandler(batch: MessageBatch<unknown>, env: Env) {
             .run();
       } else if (body.kind === 'ingest') await processIngestion(env, body.id);
       else if (body.kind === 'send') await dispatchSend(env, body.id);
+      else if (body.kind === 'purge-mailbox')
+        await purgeMailboxFiles(env, body.id);
       else await cloudflareEvent(env, message.body);
       message.ack();
     } catch {
@@ -57,6 +60,17 @@ export async function scheduledHandler(env: Env) {
       .all<{ id: string }>()
   ).results)
     tasks.push({ kind: 'send', id: row.id });
+  const deletions = (
+    await env.DB.prepare(
+      'SELECT id FROM mailbox_deletions ORDER BY created_at LIMIT 10',
+    ).all<{ id: string }>()
+  ).results;
+  for (const deletion of deletions)
+    try {
+      await purgeMailboxFiles(env, deletion.id);
+    } catch {
+      /* The durable record remains for the next cron tick. */
+    }
   if (tasks.length) await env.JOBS.sendBatch(tasks.map((body) => ({ body })));
   const unmaterialized = (
     await env.DB.prepare(

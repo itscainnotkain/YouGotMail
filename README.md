@@ -20,6 +20,8 @@ A private, Gmail-inspired email app with a calmer interface, your own branding, 
 
 Shared members have equal access to their shared mailbox, including drafts, read state and labels. Administrators configure users and mailbox membership; private email is accessible only to its mailbox members.
 
+Owners and administrators can permanently delete a mailbox in **Settings → Mailboxes**: expand the mailbox, choose **Delete mailbox**, and type its name to confirm. Deletion removes its mail, drafts, aliases, labels, filters and memberships, cancels queued/scheduled sends, clears catch-all assignments and removes it from pending invitations. User accounts and domains remain. Stored files are removed in retryable background batches. A mailbox actively sending or processing mail must finish that operation before deletion.
+
 ## Run locally
 
 Use Node.js 24 LTS or newer.

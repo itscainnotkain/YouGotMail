@@ -12,11 +12,13 @@ import {
   id,
   json,
   nameSchema,
+  notifyMailbox,
   now,
   publicUser,
 } from './lib';
 import { digest, token } from './crypto';
 import { sendSystemEmail } from './sending';
+import { deleteMailbox } from './mailbox-deletion';
 
 export const administration = new Hono<AppEnv>();
 administration.use('*', authenticate);
@@ -256,6 +258,26 @@ administration.post('/mailboxes', async (c) => {
   await c.env.DB.batch(statements);
   await audit(c.env, c.get('user').id, 'mailbox.create', mailboxId, email);
   return c.json({ id: mailboxId, addressId, email }, 201);
+});
+administration.delete('/mailboxes/:id', async (c) => {
+  const mailboxId = z.string().uuid().parse(c.req.param('id'));
+  const { confirmation } = await body(
+    c,
+    z.object({ confirmation: z.string().min(1).max(100) }),
+  );
+  const deletionId = await deleteMailbox(
+    c.env,
+    c.get('user').id,
+    mailboxId,
+    confirmation,
+  );
+  c.executionCtx.waitUntil(
+    Promise.allSettled([
+      c.env.JOBS.send({ kind: 'purge-mailbox', id: deletionId }),
+      notifyMailbox(c.env, mailboxId),
+    ]),
+  );
+  return c.json({ ok: true }, 202);
 });
 administration.patch('/mailboxes/:id', async (c) => {
   const data = await body(

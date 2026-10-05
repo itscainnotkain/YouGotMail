@@ -233,6 +233,18 @@ function SessionShell({
     setProfile(false);
   }, [location.pathname, selectedMailbox]);
   useEffect(() => {
+    if (!boxes.data) return;
+    if (selectedMailbox && !boxes.data.some((b) => b.id === selectedMailbox)) {
+      const next = new URLSearchParams(search);
+      next.delete('mailbox');
+      setSearch(next, { replace: true });
+    }
+    if (draft && !boxes.data.some((b) => b.id === draft.mailbox_id)) {
+      setDraft(null);
+      toast('This mailbox is no longer available.');
+    }
+  }, [boxes.data, selectedMailbox, draft, search, setSearch, toast]);
+  useEffect(() => {
     const sockets = mailboxes.map((box) => {
       const socket = new WebSocket(
         `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/v1/mail/live/${box.id}`,

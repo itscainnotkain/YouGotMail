@@ -1930,6 +1930,7 @@ kbd {
 }
 .mailbox-buttons {
   display: flex;
+  flex-wrap: wrap;
   gap: 9px;
   padding-top: 16px;
 }
